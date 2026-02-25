@@ -6,3 +6,4 @@ find_package(OpenMP REQUIRED)
 
 add_executable(hands_on_profiling main.cpp)
 target_link_libraries(hands_on_profiling PRIVATE OpenMP::OpenMP_CXX)
+target_compile_options(hands_on_profiling PRIVATE -march=native -mavx2 -mfma)
