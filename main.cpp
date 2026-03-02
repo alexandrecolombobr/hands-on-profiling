@@ -15,7 +15,7 @@ void totalizeValue(const double &price, double &total, double &max, double &min)
 
 int main() {
     double startTime = omp_get_wtime();
-    std::ifstream file("ETHUSDT.csv");
+    std::ifstream file("BTCUSDT.csv");
 
     if (!file.is_open()) {
         std::cerr << "Error: Could not open file ETHUST.csv" << std::endl;
