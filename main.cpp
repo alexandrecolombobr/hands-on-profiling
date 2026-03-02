@@ -11,66 +11,132 @@ struct Stats {
     double max;
 };
 
-Stats compute_stats_avx2(const std::vector<double>& data) {
-    const std::size_t n = data.size();
-    const std::size_t simdWidth = 4; // AVX2 = 4 doubles
-    const std::size_t vec_blocks = n / simdWidth;
+Stats compute_stats_avx2(const std::vector<int32_t>& data) {
+    const size_t n = data.size();
+    const size_t simdWidth = 8;               // AVX2: 8 x int32
+    const size_t vec_blocks = n / simdWidth;
 
-    double global_sum = 0.0;
-    double global_min = std::numeric_limits<double>::max();
-    double global_max = std::numeric_limits<double>::lowest();
+    int nthreads = omp_get_max_threads();
+
+    std::vector<int64_t> thread_sum(nthreads, 0);
+    std::vector<int32_t> thread_min(nthreads, std::numeric_limits<int32_t>::max());
+    std::vector<int32_t> thread_max(nthreads, std::numeric_limits<int32_t>::lowest());
 
 #pragma omp parallel
     {
-        __m256d local_sum_vec = _mm256_setzero_pd();
-        __m256d local_min_vec = _mm256_set1_pd(std::numeric_limits<double>::max());
-        __m256d local_max_vec = _mm256_set1_pd(std::numeric_limits<double>::lowest());
+        int tid = omp_get_thread_num();
 
-        double local_sum = 0.0;
-        double local_min = std::numeric_limits<double>::max();
-        double local_max = std::numeric_limits<double>::lowest();
+        __m256i sum_lo = _mm256_setzero_si256(); // 4 x int64
+        __m256i sum_hi = _mm256_setzero_si256(); // 4 x int64
+
+        __m256i min_vec = _mm256_set1_epi32(std::numeric_limits<int32_t>::max());
+        __m256i max_vec = _mm256_set1_epi32(std::numeric_limits<int32_t>::lowest());
 
 #pragma omp for schedule(static)
-        for (std::size_t b = 0; b < vec_blocks; ++b) {
-            std::size_t i = b * simdWidth;
-            __m256d v = _mm256_loadu_pd(&data[i]);
+        for (size_t b = 0; b < vec_blocks; ++b) {
+            size_t i = b * simdWidth;
 
-            local_sum_vec = _mm256_add_pd(local_sum_vec, v);
-            local_min_vec = _mm256_min_pd(local_min_vec, v);
-            local_max_vec = _mm256_max_pd(local_max_vec, v);
+            __m256i v = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(&data[i])
+            );
+
+            // min / max 32-bit
+            min_vec = _mm256_min_epi32(min_vec, v);
+            max_vec = _mm256_max_epi32(max_vec, v);
+
+            // widening para 64-bit
+            __m128i lo128 = _mm256_castsi256_si128(v);
+            __m128i hi128 = _mm256_extracti128_si256(v, 1);
+
+            __m256i lo64 = _mm256_cvtepi32_epi64(lo128);
+            __m256i hi64 = _mm256_cvtepi32_epi64(hi128);
+
+            sum_lo = _mm256_add_epi64(sum_lo, lo64);
+            sum_hi = _mm256_add_epi64(sum_hi, hi64);
         }
 
-        alignas(32) double tmp_sum[4];
-        alignas(32) double tmp_min[4];
-        alignas(32) double tmp_max[4];
+        // Redução horizontal soma
+        alignas(32) int64_t tmp_lo[4];
+        alignas(32) int64_t tmp_hi[4];
 
-        _mm256_store_pd(tmp_sum, local_sum_vec);
-        _mm256_store_pd(tmp_min, local_min_vec);
-        _mm256_store_pd(tmp_max, local_max_vec);
+        _mm256_store_si256((__m256i*)tmp_lo, sum_lo);
+        _mm256_store_si256((__m256i*)tmp_hi, sum_hi);
 
-        for (int i = 0; i < 4; ++i) {
-            local_sum += tmp_sum[i];
+        int64_t local_sum = 0;
+        for (int i = 0; i < 4; ++i)
+            local_sum += tmp_lo[i] + tmp_hi[i];
+
+        // Redução horizontal min/max
+        alignas(32) int32_t tmp_min[8];
+        alignas(32) int32_t tmp_max[8];
+
+        _mm256_store_si256((__m256i*)tmp_min, min_vec);
+        _mm256_store_si256((__m256i*)tmp_max, max_vec);
+
+        int32_t local_min = std::numeric_limits<int32_t>::max();
+        int32_t local_max = std::numeric_limits<int32_t>::lowest();
+
+        for (int i = 0; i < 8; ++i) {
             local_min = std::min(local_min, tmp_min[i]);
             local_max = std::max(local_max, tmp_max[i]);
         }
 
-        // Cauda
+        // Processa cauda
 #pragma omp for schedule(static)
-        for (std::size_t i = vec_blocks * simdWidth; i < n; ++i) {
-            local_sum += data[i];
-            local_min = std::min(local_min, data[i]);
-            local_max = std::max(local_max, data[i]);
+        for (size_t i = vec_blocks * simdWidth; i < n; ++i) {
+            int32_t v = data[i];
+            local_sum += v;
+            local_min = std::min(local_min, v);
+            local_max = std::max(local_max, v);
         }
 
-#pragma omp critical
-        {
-            global_sum += local_sum;
-            global_min = std::min(global_min, local_min);
-            global_max = std::max(global_max, local_max);
-        }
+        thread_sum[tid] = local_sum;
+        thread_min[tid] = local_min;
+        thread_max[tid] = local_max;
     }
 
-    return {global_sum, global_min, global_max};
+    // Redução final
+    int64_t global_sum = 0;
+    int32_t global_min = std::numeric_limits<int32_t>::max();
+    int32_t global_max = std::numeric_limits<int32_t>::lowest();
+
+    for (int t = 0; t < nthreads; ++t) {
+        global_sum += thread_sum[t];
+        global_min = std::min(global_min, thread_min[t]);
+        global_max = std::max(global_max, thread_max[t]);
+    }
+
+    return {(global_sum / 100.0)
+        , (global_min / 100.0)
+        , (global_max / 100.0)};
+}
+
+inline int32_t parse_price_scaled(const char* begin, const char* end) {
+    int32_t value = 0;
+    int decimals = 0;
+    bool after_dot = false;
+
+    for (const char* p = begin; p < end; ++p) {
+        char c = *p;
+
+        if (c == '.') {
+            after_dot = true;
+            continue;
+        }
+
+        if (after_dot && decimals >= 2)
+            break;
+
+        value = value * 10 + (c - '0');
+
+        if (after_dot)
+            decimals++;
+    }
+
+    if (after_dot && decimals == 1)
+        value *= 10;
+
+    return value;
 }
 
 int main() {
@@ -83,7 +149,7 @@ int main() {
         return 1;
     }
 
-    std::vector<double> prices;
+    std::vector<int32_t> prices;
     prices.reserve(5575530);
 
     std::string line;
@@ -92,23 +158,29 @@ int main() {
     std::getline(file, line);
 
     while (std::getline(file, line)) {
+        const char* ptr = line.c_str();
+        const char* end = ptr + line.size();
 
-        size_t first = line.find(',');
-        size_t second = line.find(',', first + 1);
-        size_t third = line.find(',', second + 1);
+        int comma_count = 0;
+        const char* price_begin = nullptr;
+        const char* price_end = nullptr;
 
-        if (second == std::string::npos || third == std::string::npos)
-            continue;
-
-        std::string priceStr = line.substr(second + 1, third - second - 1);
-
-        try {
-            prices.emplace_back(std::stod(
-                line.substr(second + 1, third - second - 1)
-            ));
-        } catch (...) {
-            std::cerr << "Invalid price in line: " << line << std::endl;
+        for (const char* p = ptr; p < end; ++p) {
+            if (*p == ',') {
+                comma_count++;
+                if (comma_count == 2)
+                    price_begin = p + 1;
+                else if (comma_count == 3) {
+                    price_end = p;
+                    break;
+                }
+            }
         }
+
+        if (price_begin && price_end)
+            prices.emplace_back(
+                parse_price_scaled(price_begin, price_end)
+            );
     }
 
     file.close();
