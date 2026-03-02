@@ -1,9 +1,11 @@
 #include <iostream>
 #include <fstream>
-#include <string>
 #include <vector>
 #include <omp.h>
 #include <immintrin.h>
+#include <limits>
+#include <random>
+#include <cstdlib>
 
 struct Stats {
     double sum;
@@ -142,48 +144,19 @@ inline int32_t parse_price_scaled(const char* begin, const char* end) {
 int main() {
     //omp_set_num_threads(1);
     double startTime = omp_get_wtime();
-    std::ifstream file("BTCUSDT.csv");
 
-    if (!file.is_open()) {
-        std::cerr << "Error: Could not open file ETHUST.csv" << std::endl;
-        return 1;
-    }
+    // Quantidade configurável via argumento
+    std::size_t valuesSize = 200000000; // default
 
     std::vector<int32_t> prices;
-    prices.reserve(5575530);
+    prices.reserve(valuesSize);
 
-    std::string line;
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<int32_t> dist(100000, 900000);
 
-    // Skip header (remove if file has no header)
-    std::getline(file, line);
-
-    while (std::getline(file, line)) {
-        const char* ptr = line.c_str();
-        const char* end = ptr + line.size();
-
-        int comma_count = 0;
-        const char* price_begin = nullptr;
-        const char* price_end = nullptr;
-
-        for (const char* p = ptr; p < end; ++p) {
-            if (*p == ',') {
-                comma_count++;
-                if (comma_count == 2)
-                    price_begin = p + 1;
-                else if (comma_count == 3) {
-                    price_end = p;
-                    break;
-                }
-            }
-        }
-
-        if (price_begin && price_end)
-            prices.emplace_back(
-                parse_price_scaled(price_begin, price_end)
-            );
+    for (std::size_t i = 0; i < valuesSize; ++i) {
+        prices.emplace_back(dist(rng));
     }
-
-    file.close();
 
     Stats stats = compute_stats_avx2(prices);
 
