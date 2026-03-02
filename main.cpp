@@ -13,7 +13,8 @@ struct Stats {
 
 Stats compute_stats_avx2(const std::vector<double>& data) {
     const std::size_t n = data.size();
-    const std::size_t simdWidth = 4;
+    const std::size_t simdWidth = 4; // AVX2 = 4 doubles
+    const std::size_t vec_blocks = n / simdWidth;
 
     double global_sum = 0.0;
     double global_min = std::numeric_limits<double>::max();
@@ -29,8 +30,9 @@ Stats compute_stats_avx2(const std::vector<double>& data) {
         double local_min = std::numeric_limits<double>::max();
         double local_max = std::numeric_limits<double>::lowest();
 
-#pragma omp for nowait
-        for (std::size_t i = 0; i < n - (n % simdWidth); i += simdWidth) {
+#pragma omp for schedule(static)
+        for (std::size_t b = 0; b < vec_blocks; ++b) {
+            std::size_t i = b * simdWidth;
             __m256d v = _mm256_loadu_pd(&data[i]);
 
             local_sum_vec = _mm256_add_pd(local_sum_vec, v);
@@ -38,22 +40,23 @@ Stats compute_stats_avx2(const std::vector<double>& data) {
             local_max_vec = _mm256_max_pd(local_max_vec, v);
         }
 
-        alignas(32) double temp_sum[4];
-        alignas(32) double temp_min[4];
-        alignas(32) double temp_max[4];
+        alignas(32) double tmp_sum[4];
+        alignas(32) double tmp_min[4];
+        alignas(32) double tmp_max[4];
 
-        _mm256_store_pd(temp_sum, local_sum_vec);
-        _mm256_store_pd(temp_min, local_min_vec);
-        _mm256_store_pd(temp_max, local_max_vec);
+        _mm256_store_pd(tmp_sum, local_sum_vec);
+        _mm256_store_pd(tmp_min, local_min_vec);
+        _mm256_store_pd(tmp_max, local_max_vec);
 
         for (int i = 0; i < 4; ++i) {
-            local_sum += temp_sum[i];
-            local_min = std::min(local_min, temp_min[i]);
-            local_max = std::max(local_max, temp_max[i]);
+            local_sum += tmp_sum[i];
+            local_min = std::min(local_min, tmp_min[i]);
+            local_max = std::max(local_max, tmp_max[i]);
         }
 
-#pragma omp for nowait
-        for (std::size_t i = n - (n % simdWidth); i < n; ++i) {
+        // Cauda
+#pragma omp for schedule(static)
+        for (std::size_t i = vec_blocks * simdWidth; i < n; ++i) {
             local_sum += data[i];
             local_min = std::min(local_min, data[i]);
             local_max = std::max(local_max, data[i]);
@@ -100,7 +103,6 @@ int main() {
         std::string priceStr = line.substr(second + 1, third - second - 1);
 
         try {
-            double price = std::stod(priceStr);
             prices.emplace_back(std::stod(
                 line.substr(second + 1, third - second - 1)
             ));
